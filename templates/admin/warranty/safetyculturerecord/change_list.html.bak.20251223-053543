@@ -1,0 +1,9 @@
+{% extends "admin/change_list.html" %}
+{% load i18n %}
+
+{% block object-tools-items %}
+  <li>
+    <a href="{% url admin:warranty_sc_refresh_and_verify %}" class="addlink">{% trans "Refresh (pull new + verify)" %}</a>
+  </li>
+  {{ block.super }}
+{% endblock %}

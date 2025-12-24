@@ -1,0 +1,529 @@
+import json, logging, os, requests
+from datetime import datetime, date, timezone
+from typing import Any, Dict, Optional
+import logging
+
+from django.contrib import admin, messages
+from django.urls import path
+from django.shortcuts import redirect
+from django.db import transaction
+from plugin import registry
+from .models import SafetyCultureRecord
+
+from django.contrib.admin.sites import AlreadyRegistered
+
+logger = logging.getLogger(__name__)
+
+def _headers(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+
+def _parse_iso_dt(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+def _parse_iso_date(s):
+    if not s:
+        return None
+    if isinstance(s, str) and s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(s).date()
+    except Exception:
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except Exception:
+                pass
+        return None
+
+def _walk_any(n):
+    if isinstance(n, dict):
+        yield n
+        for k in ("header_items", "items", "children", "template_items"):
+            v = n.get(k)
+            if isinstance(v, list):
+                for c in v:
+                    yield from _walk_any(c)
+    elif isinstance(n, list):
+        for c in n:
+            yield from _walk_any(c)
+
+def _resp_text(resp):
+    # SafetyCulture sometimes returns:
+    # - dict responses
+    # - list of response objects
+    # - nested objects under selected/media/metadata
+    if resp is None:
+        return None
+
+    # If it's a list, try each element until we find something usable
+    if isinstance(resp, list):
+        for r in resp:
+            v = _resp_text(r)
+            if v:
+                return v
+        return None
+
+    # If it's not a dict by here, we can't parse it
+    if not isinstance(resp, dict):
+        return None
+
+    for k in ("text", "value", "string", "string_value"):
+        v = resp.get(k)
+        if isinstance(v, (str, int, float)) and str(v).strip():
+            return str(v)
+
+    # Some responses nest the actual answer inside another dict
+    nested = resp.get("response")
+    if isinstance(nested, dict):
+        v = _resp_text(nested)
+        if v:
+            return v
+
+    sel = resp.get("selected")
+    if isinstance(sel, list) and sel:
+        for c in sel:
+            if isinstance(c, dict):
+                for k in ("label", "value", "text"):
+                    v = c.get(k)
+                    if isinstance(v, (str, int, float)) and str(v).strip():
+                        return str(v)
+
+    med = resp.get("media")
+    if isinstance(med, list) and med:
+        for m in med:
+            if isinstance(m, dict):
+                for k in ("data", "text", "value"):
+                    v = m.get(k)
+                    if isinstance(v, (str, int, float)) and str(v).strip():
+                        return str(v)
+                md = m.get("metadata") or {}
+                if isinstance(md, dict):
+                    for k in ("data", "text", "value"):
+                        v = md.get(k)
+                        if isinstance(v, (str, int, float)) and str(v).strip():
+                            return str(v)
+
+    return None
+
+
+def _find_regex(payload, pattern: str):
+    """Search any response text/value for a regex match; returns first match or None."""
+    try:
+        rx = re.compile(pattern)
+    except Exception:
+        return None
+    for it in _walk_any(payload):
+        resp = it.get("responses") or it.get("response") or {}
+        val = _resp_text(resp) or it.get("value")
+        if not isinstance(val, (str, int, float)):
+            continue
+        s = str(val)
+        m = rx.search(s)
+        if m:
+            return m.group(0)
+    return None
+
+def _find_by_label(payload, label):
+    if not label:
+        return None
+    want = str(label).strip().lower()
+    for it in _walk_any(payload):
+        if str(it.get("label", "")).strip().lower() == want:
+            resp = it.get("responses") or it.get("response") or {}
+            val = _resp_text(resp) or it.get("value")
+            if isinstance(val, (str, int, float)):
+                return str(val)
+    return None
+
+def _add_years(d: date, years: int) -> date:
+    try:
+        from dateutil.relativedelta import relativedelta
+        return d + relativedelta(years=years)
+    except Exception:
+        try:
+            return d.replace(year=d.year + years)
+        except ValueError:
+            return d.replace(month=2, day=28, year=d.year + years)
+
+def _model_and_years_from_serial(unit_sn: str, rules_json: str) -> tuple[str, int]:
+    s = (unit_sn or "").strip().upper()
+    try:
+        rules = json.loads(rules_json or "{}")
+    except Exception:
+        rules = {}
+    best_key, best_len = None, -1
+    for k in rules.keys():
+        ku = str(k).upper()
+        if s.startswith(ku) and len(ku) > best_len:
+            best_key, best_len = k, len(ku)
+    if best_key is not None:
+        cfg = rules[best_key] or {}
+        length = int(cfg.get("length", 3))
+        years = int(cfg.get("warranty", cfg.get("warranty_years", 1)))
+        return s[:length], years
+    return s[:3], 1
+
+def _list_audits(base_url: str, token: str, template_id: str, modified_after: Optional[str]) -> list[dict]:
+    """Return audit search rows (audit_id, modified_at) newer than modified_after (ISO)."""
+    url = f"{base_url.rstrip('/')}/audits/search"
+    params = [("field", "audit_id"), ("field", "modified_at"), ("template", template_id)]
+    if modified_after:
+        params.append(("modified_after", modified_after))
+
+    rows = []
+    # SafetyCulture search is cursor-like via modified_after; we step forward by updating it
+    last = modified_after
+    while True:
+        ps = list(params)
+        if last:
+            # keep advancing – SC returns in ascending modified order
+            ps = [p for p in ps if p[0] != "modified_after"] + [("modified_after", last)]
+        r = requests.get(url, headers=_headers(token), params=ps, timeout=60)
+        r.raise_for_status()
+        data = r.json() or {}
+        audits = data.get("audits") or []
+        if not audits:
+            break
+        rows.extend(audits)
+        last = audits[-1].get("modified_at")
+        if not last:
+            break
+        # loop again with a newer modified_after so we don’t re-fetch the same page
+        if len(audits) == 1 and _parse_iso_dt(last) == _parse_iso_dt(modified_after or ""):
+            break
+        modified_after = last
+    return rows
+
+def _get_detail(base_url: str, token: str, audit_id: str) -> Dict[str, Any]:
+    r = requests.get(f"{base_url.rstrip('/')}/audits/{audit_id}", headers=_headers(token), timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+def run_sc_sync(*, incremental: bool = True, print_each: bool = False, verify_only: bool = False) -> dict:
+    """
+    Sync from SafetyCulture.
+      - incremental=True uses SC_SYNC_CURSOR as modified_after
+      - verify_only=True checks that listed audits exist in DB (no writes)
+    Returns counters: dict(created, updated, skipped, errors, checked, new_cursor)
+    """
+    p = registry.get_plugin("warranty")
+
+    def _get(name, default=""):
+        try:
+            v = p.get_setting(name) if p else None
+            if isinstance(v, str) and v.strip():
+                return v
+        except Exception:
+            pass
+        return os.environ.get(name, default)
+
+    base_url   = (_get("SC_BASE_URL", "https://api.safetyculture.io")).rstrip("/")
+    token      = (_get("SC_API_TOKEN") or "").strip()
+    template   = (_get("SC_TEMPLATE_ID") or "").strip()
+    lbl_audit  = _get("LABEL_AUDIT_DATE", "Conducted on")
+    lbl_ums    = _get("LABEL_UMS_SN", "UMS QR Code")
+    lbl_tm     = _get("LABEL_TM_ID", "Unit QR Code")
+    lbl_sn     = _get("LABEL_UNIT_SN", "Unit Serial Number")
+    rules      = _get("SERIAL_PREFIX_RULES", '{"IG":{"length":3,"warranty":3}}')
+    cursor_in  = _get("SC_SYNC_CURSOR", "") if incremental else ""
+
+    if not token or not template:
+        raise RuntimeError("Set SC_API_TOKEN and SC_TEMPLATE_ID")
+
+    created = updated = skipped = errors = checked = 0
+    new_cursor_dt: Optional[datetime] = _parse_iso_dt(cursor_in)
+
+    # 1) list candidate audits
+    rows = _list_audits(base_url, token, template, cursor_in or None)
+
+    for row in rows:
+        try:
+            audit_id = row.get("audit_id")
+            mod_at   = _parse_iso_dt(row.get("modified_at"))
+            checked += 1
+            if mod_at and (not new_cursor_dt or mod_at > new_cursor_dt):
+                new_cursor_dt = mod_at
+
+            if verify_only:
+                # verification mode: ensure present
+                if audit_id and not SafetyCultureRecord.objects.filter(audit_id=audit_id).exists():
+                    logger.warning("Missing in DB: audit_id=%s (modified_at=%s)", audit_id, row.get("modified_at"))
+                continue
+
+            detail = _get_detail(base_url, token, audit_id)
+
+            unit_sn = (_find_by_label(detail, lbl_sn) or "").strip().upper()
+            # Reject bad serials (URLs / empty / not IG1 / non-alnum)
+            if (not unit_sn) or ("://" in unit_sn) or (not unit_sn.startswith("IG1")) or (not unit_sn[3:].isalnum()):
+                skipped += 1
+                continue
+            # UMS SN: prefer configured label, then common labels, then regex ####-####
+            ums_sn = (
+                (_find_by_label(detail, lbl_ums) or "")
+                or (_find_by_label(detail, "UMS QR Code") or "")
+                or (_find_by_label(detail, "UMS SN") or "")
+            ).strip()
+            if not ums_sn:
+                ums_sn = (_find_regex(detail, r"\b\d{4}-\d{4}\b") or "").strip()
+            ums_sn = ums_sn or None
+
+            # TM Device ID: prefer configured label, then common labels, then regex TMxxxx...
+            tm_id = (
+                (_find_by_label(detail, lbl_tm) or "")
+                or (_find_by_label(detail, "Asset tag") or "")
+                or (_find_by_label(detail, "Asset Tag:") or "")
+                or (_find_by_label(detail, "Unit QR Code") or "")
+            ).strip()
+            if not tm_id:
+                tm_id = (_find_regex(detail, r"\bTM[0-9A-Z]{3,}\b") or "").strip()
+            tm_id = tm_id or None
+
+            ad_meta = detail.get("audit_data") or {}
+            audit_raw = (_find_by_label(detail, lbl_audit)
+                         or ad_meta.get("completed_date")
+                         or ad_meta.get("completed_at")
+                         or detail.get("completed_at")
+                         or detail.get("created_at"))
+            audit_date = _parse_iso_date(audit_raw)
+            if not audit_date:
+                skipped += 1
+                continue
+
+            model_number, years = _model_and_years_from_serial(unit_sn, rules)
+            warranty_expiry = _add_years(audit_date, years)
+
+            with transaction.atomic():
+                obj, was_created = SafetyCultureRecord.objects.update_or_create(
+                    unit_sn=unit_sn,
+                    defaults=dict(
+                        audit_id=audit_id,
+                        model_number=model_number,
+                        ums_sn=ums_sn,
+                        tm_device_id=tm_id,
+                        audit_date=audit_date,
+                        warranty_expiry=warranty_expiry,
+                        sc_modified_at=mod_at,
+                        payload=detail,
+                    ),
+                )
+
+            if was_created:
+                created += 1
+            else:
+                updated += 1
+
+            if print_each:
+                logger.info("AUDIT synced id=%s unit=%s date=%s expiry=%s", audit_id, unit_sn, audit_date, warranty_expiry)
+
+        except Exception:
+            errors += 1
+            logger.exception("Audit %s failed", row.get("audit_id"))
+
+    # persist new cursor if incremental and we actually advanced
+    out = dict(created=created, updated=updated, skipped=skipped, errors=errors, checked=checked)
+    if incremental and p and new_cursor_dt:
+        iso = new_cursor_dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        try:
+            p.set_setting("SC_SYNC_CURSOR", iso)
+            out["new_cursor"] = iso
+        except Exception:
+            logger.exception("Failed to save SC_SYNC_CURSOR")
+
+    _ret = out
+    try:
+        inc = locals().get('incremental', None)
+        ver = locals().get('verify_only', None)
+        if isinstance(_ret, dict):
+            processed = _ret.get('checked') or _ret.get('processed') or 0
+            added = _ret.get('created') or 0
+            logger.warning(
+                'SC sync summary: incremental=%s verify_only=%s processed=%s added=%s updated=%s skipped=%s errors=%s cursor=%s',
+                inc, ver, processed, added,
+                _ret.get('updated'), _ret.get('skipped'), _ret.get('errors'), _ret.get('new_cursor')
+            )
+        else:
+            logger.warning('SC sync summary: return type=%s (not dict)', type(_ret))
+    except Exception as e:
+        logger.exception('SC sync summary logging failed: %s', e)
+    return _ret
+
+# Admin actions
+
+def sync_from_safetyculture(modeladmin, request, queryset):
+    try:
+        res = run_sc_sync(incremental=True, print_each=False, verify_only=False)
+        msg = f"SC sync: created={res['created']} updated={res['updated']} skipped={res['skipped']} checked={res['checked']}"
+        if res.get("errors"): msg += f" errors={res['errors']}"
+        if res.get("new_cursor"): msg += f" cursor={res['new_cursor']}"
+        messages.success(request, msg)
+    except Exception as e:
+        messages.error(request, str(e))
+
+sync_from_safetyculture.short_description = "Sync from SafetyCulture (incremental)"
+
+def verify_all_synced(modeladmin, request, queryset):
+    try:
+        res = run_sc_verify_all(print_missing=True, limit=None)
+        msg = (
+            f"SC verify: checked={res['checked']} missing={res['missing']} "
+            f"bad_serials={res['bad_serials']} missing_dates={res['missing_dates']}. "
+            "See server logs for details."
+        )
+        messages.info(request, msg)
+    except Exception as e:
+        messages.error(request, str(e))
+
+verify_all_synced.short_description = "Verify all audits are present (no writes)"
+
+
+class SafetyCultureRecordAdmin(admin.ModelAdmin):
+    # Add top-right buttons on the changelist page
+    change_list_template = "admin/warranty/safetyculturerecord/change_list.html"
+
+    def get_urls(self):
+        urls = super().get_urls()
+        custom = [
+            path("refresh/", self.admin_site.admin_view(getattr(self, 'refresh_and_verify_sc', self.refresh_sc)), name="warranty_sc_refresh"),
+            path('refresh_and_verify/', self.admin_site.admin_view(getattr(self, 'refresh_and_verify_sc', self.refresh_sc)), name='admin:warranty_sc_refresh_and_verify'),
+            path("verify/", self.admin_site.admin_view(self.verify_sc), name="warranty_sc_verify"),
+        ]
+        return custom + urls
+
+    def refresh_sc(self, request):
+        res = run_sc_sync(incremental=True, print_each=False, verify_only=False)
+        msg = f"Refresh: created={res.get('created', 0)} updated={res.get('updated', 0)} skipped={res.get('skipped', 0)} checked={res.get('checked', 0)}"
+        if res.get("errors"):
+            msg += f" errors={res[errors]}"
+        self.message_user(request, msg, level=messages.SUCCESS)
+        return redirect("..")
+
+    def verify_sc(self, request):
+        res = run_sc_sync(incremental=False, print_each=False, verify_only=True)
+        msg = f"Verify: checked={res.get('checked', 0)} (see logs for any missing audit_ids)"
+        self.message_user(request, msg, level=messages.INFO)
+        return redirect("..")
+
+    list_display = ("unit_sn", "model_number", "audit_date", "warranty_expiry", "ums_sn", "tm_device_id", "audit_id", "sc_modified_at")
+    search_fields = ("unit_sn", "model_number", "ums_sn", "tm_device_id", "audit_id")
+    list_filter = ("audit_date",)
+    actions = [sync_from_safetyculture, verify_all_synced]
+# try:
+# except AlreadyRegistered:
+#     pass
+
+# SC API Token: 7411e799480279aab66382cf9156b9f26481bbdf1cf450f5e34964a3b9168db4
+# Inventree API Token: inv-3f994b27bfff196cf8a0d4bea436249b29857a3d-20250911
+
+
+
+
+# --- Admin registration (idempotent; safe across plugin reloads) ---
+from django.contrib.admin.sites import AlreadyRegistered, NotRegistered
+
+try:
+    admin.site.unregister(SafetyCultureRecord)
+except NotRegistered:
+    pass
+
+try:
+    admin.site.register(SafetyCultureRecord, SafetyCultureRecordAdmin)
+except AlreadyRegistered:
+    pass
+
+    def refresh_and_verify_sc(self, request):
+        """Full refresh behaviour: restore missing audits (e.g. if someone deleted rows).
+        This resets any stored cursor so refresh will re-import older audits, then runs verify/backfill.
+        """
+        # Reset cursor in plugin settings (so incremental sync will re-fetch)
+        try:
+            from plugin.models import PluginConfig
+            cfg = PluginConfig.objects.get(key='warranty')
+            settings = dict(cfg.settings or {})
+            for k in list(settings.keys()):
+                if 'cursor' in k.lower():
+                    settings[k] = None
+            cfg.settings = settings
+            cfg.save()
+        except Exception:
+            # If cursor reset fails, still proceed
+            pass
+
+        # Run refresh (import)
+        try:
+            resp = self.refresh_sc(request)
+        except Exception:
+            resp = None
+
+        # Run verify/backfill (recreate missing)
+        try:
+            return self.verify_sc(request)
+        except Exception:
+            # If verify fails, at least return refresh response
+            return resp
+
+
+# --- WARRANTY HOTFIX: refresh_and_verify_sc attachment ---
+def _warranty_refresh_and_verify_sc(self, request):
+    """Run refresh then verify/backfill.
+    Also clears any stored cursor so deleted audits can be re-imported.
+    """
+    # Reset cursor in plugin settings
+    try:
+        from plugin.models import PluginConfig
+        cfg = PluginConfig.objects.get(key='warranty')
+        settings = dict(cfg.settings or {})
+        for k in list(settings.keys()):
+            if 'cursor' in k.lower():
+                settings[k] = None
+        cfg.settings = settings
+        cfg.save()
+    except Exception:
+        pass
+
+    # Incremental refresh (import)
+    try:
+        self.refresh_sc(request)
+    except Exception:
+        pass
+
+    # Verify/backfill (restore missing)
+    return self.verify_sc(request)
+
+# Attach method to the actual admin class even if indentation/placement is wrong elsewhere
+try:
+    SafetyCultureRecordAdmin.refresh_and_verify_sc = _warranty_refresh_and_verify_sc
+except Exception:
+    pass
+
+
+# --- WARRANTY: attach refresh_and_verify_sc ---
+def _refresh_and_verify_sc(self, request):
+    """Refresh + backfill so deleted audits are re-imported."""
+    try:
+        from plugin.models import PluginConfig
+        cfg = PluginConfig.objects.get(key='warranty')
+        settings = dict(cfg.settings or {})
+        for k in list(settings.keys()):
+            if 'cursor' in k.lower():
+                settings[k] = None
+        cfg.settings = settings
+        cfg.save()
+    except Exception:
+        pass
+    try:
+        self.refresh_sc(request)
+    except Exception:
+        pass
+    return self.verify_sc(request)
+
+try:
+    SafetyCultureRecordAdmin.refresh_and_verify_sc = _refresh_and_verify_sc
+except Exception:
+    pass
