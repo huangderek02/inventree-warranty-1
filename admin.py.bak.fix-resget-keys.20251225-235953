@@ -541,8 +541,8 @@ def warranty_full_refresh_view(request):
     try:
         res = run_sc_sync(incremental=False, print_each=False, verify_only=False)
         msg = (
-            f"Full refresh: created={res.get('created', 0)} updated={res.get('updated', 0)} "
-            f"skipped={res.get('skipped', 0)} checked={res.get('checked', 0)}"
+            f"Full refresh: created={res.get(created, 0)} updated={res.get(updated, 0)} "
+            f"skipped={res.get(skipped, 0)} checked={res.get(checked, 0)}"
         )
         if res.get("errors"):
             msg += f" errors={res.get(errors)}"

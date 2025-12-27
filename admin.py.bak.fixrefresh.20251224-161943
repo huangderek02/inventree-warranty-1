@@ -358,7 +358,7 @@ def run_sc_sync(*, incremental: bool = True, print_each: bool = False, verify_on
 
 def sync_from_safetyculture(modeladmin, request, queryset):
     try:
-        res = run_sc_sync(incremental=False, print_each=False, verify_only=False)
+        res = run_sc_sync(incremental=True, print_each=False, verify_only=False)
         msg = f"SC sync: created={res['created']} updated={res['updated']} skipped={res['skipped']} checked={res['checked']}"
         if res.get("errors"): msg += f" errors={res['errors']}"
         if res.get("new_cursor"): msg += f" cursor={res['new_cursor']}"
@@ -397,7 +397,7 @@ class SafetyCultureRecordAdmin(admin.ModelAdmin):
         return custom + urls
 
     def refresh_sc(self, request):
-        res = run_sc_sync(incremental=False, print_each=False, verify_only=False)
+        res = run_sc_sync(incremental=True, print_each=False, verify_only=False)
         msg = f"Refresh: created={res.get('created', 0)} updated={res.get('updated', 0)} skipped={res.get('skipped', 0)} checked={res.get('checked', 0)}"
         if res.get("errors"):
             msg += f" errors={res.get('errors')}"
@@ -531,28 +531,15 @@ except Exception:
 
 # --- WARRANTY: full refresh view ---
 def warranty_full_refresh_view(request):
-    """Full re-import from SafetyCulture (restores deleted rows). Never hard-500."""
-    import logging
-    from django.contrib import messages
-    from django.shortcuts import redirect
-
-    logger = logging.getLogger("inventree")
-
-    try:
-        res = run_sc_sync(incremental=False, print_each=False, verify_only=False)
-        msg = (
-            f"Full refresh: created={res.get('created', 0)} updated={res.get('updated', 0)} "
-            f"skipped={res.get('skipped', 0)} checked={res.get('checked', 0)}"
-        )
-        if res.get("errors"):
-            msg += f" errors={res.get(errors)}"
-        if res.get("new_cursor"):
-            msg += f" cursor={res.get(new_cursor)}"
-        messages.success(request, msg)
-    except Exception as e:
-        logger.exception("Warranty full refresh failed")
-        messages.error(request, f"Full refresh failed: {e}")
-
-    return redirect("..")
-
-
+    """Full re-import from SafetyCulture (restores deleted rows)."""
+    res = run_sc_sync(incremental=False, print_each=False, verify_only=False)
+    msg = (
+        f"Full refresh: created={res.get('created', 0)} updated={res.get('updated', 0)} "
+        f"skipped={res.get('skipped', 0)} checked={res.get('checked', 0)}"
+    )
+    if res.get('errors'):
+        msg += f" errors={res.get('errors')}"
+    if res.get('new_cursor'):
+        msg += f" cursor={res.get('new_cursor')}"
+    messages.success(request, msg)
+    return redirect('..')

@@ -213,6 +213,14 @@ def run_sc_sync(*, incremental: bool = True, print_each: bool = False, verify_on
       - verify_only=True checks that listed audits exist in DB (no writes)
     Returns counters: dict(created, updated, skipped, errors, checked, new_cursor)
     """
+    import os
+    tok = os.getenv("SC_API_TOKEN")
+    tid = os.getenv("tid")
+    if not tok or not tid:
+        pass
+    # Ensure Bearer auth ALWAYS
+    _AUTH = f"Bearer {tok}"
+
     p = registry.get_plugin("warranty")
 
     def _get(name, default=""):
@@ -226,7 +234,7 @@ def run_sc_sync(*, incremental: bool = True, print_each: bool = False, verify_on
 
     base_url   = (_get("SC_BASE_URL", "https://api.safetyculture.io")).rstrip("/")
     token      = (_get("SC_API_TOKEN") or "").strip()
-    template   = (_get("SC_TEMPLATE_ID") or "").strip()
+    template   = (_get("tid") or "").strip()
     lbl_audit  = _get("LABEL_AUDIT_DATE", "Conducted on")
     lbl_ums    = _get("LABEL_UMS_SN", "UMS QR Code")
     lbl_tm     = _get("LABEL_TM_ID", "Unit QR Code")
@@ -235,7 +243,6 @@ def run_sc_sync(*, incremental: bool = True, print_each: bool = False, verify_on
     cursor_in  = _get("SC_SYNC_CURSOR", "") if incremental else ""
 
     if not token or not template:
-        raise RuntimeError("Set SC_API_TOKEN and SC_TEMPLATE_ID")
 
     created = updated = skipped = errors = checked = 0
     new_cursor_dt: Optional[datetime] = _parse_iso_dt(cursor_in)
@@ -541,8 +548,8 @@ def warranty_full_refresh_view(request):
     try:
         res = run_sc_sync(incremental=False, print_each=False, verify_only=False)
         msg = (
-            f"Full refresh: created={res.get('created', 0)} updated={res.get('updated', 0)} "
-            f"skipped={res.get('skipped', 0)} checked={res.get('checked', 0)}"
+            f"Full refresh: created={res.get(created, 0)} updated={res.get(updated, 0)} "
+            f"skipped={res.get(skipped, 0)} checked={res.get(checked, 0)}"
         )
         if res.get("errors"):
             msg += f" errors={res.get(errors)}"
